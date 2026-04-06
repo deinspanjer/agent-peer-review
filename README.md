@@ -6,7 +6,7 @@ A Claude Code plugin marketplace for AI-to-AI peer validation. Multiple perspect
 
 ### codex-peer-review
 
-Peer validation using OpenAI Codex CLI. Validates Claude's designs, code reviews, and recommendations by getting a second opinion before presenting them to users.
+Symmetric two-AI peer review using OpenAI Codex CLI. Both AIs review the same scope **independently** in a blind pass, then debate per-issue with terminal states until convergence. Catches significantly more issues than single-pass validation.
 
 ## Installation
 
@@ -24,68 +24,90 @@ Peer validation using OpenAI Codex CLI. Validates Claude's designs, code reviews
 - **Claude Code**: Requires a Claude Pro ($20/mo), Max, Team Premium, or Enterprise subscription
 - **OpenAI Codex CLI**: Included with ChatGPT Plus/Pro/Business/Edu/Enterprise plans, or use OpenAI API credits
 
-**Install Codex CLI:**
+**Install dependencies:**
 
 ```bash
-# Install Codex CLI
+# Codex CLI (0.118.0+ required)
 npm i -g @openai/codex
-
-# Authenticate (opens browser for OAuth or prompts for API key)
 codex login
+
+# jq (required — used to parse Codex JSONL output)
+brew install jq   # macOS
+# apt install jq  # Debian/Ubuntu
 ```
 
-**Optional - Perplexity MCP (for escalation):**
+**Initialize Codex profiles** (one-time):
 
-When Claude and Codex disagree and can't resolve through discussion, the plugin escalates to external research. If you have [Perplexity MCP](https://github.com/ppl-ai/modelcontextprotocol) configured, it will be used for expert arbitration. Otherwise, the plugin falls back to WebSearch.
+```bash
+/codex-peer-review init
+```
+
+This writes `[profiles.peer-review]` and `[profiles.peer-review-summarizer]` to `~/.codex/config.toml`. Tune the models there if you want to use a different reasoning level or model family.
 
 ## How Peer Review Works
 
-1. **Claude Forms Opinion**: Claude analyzes the task and forms a recommendation
-2. **Dispatch to Reviewer**: A subagent runs the peer review agent to get a second opinion
-3. **Compare Findings**: Results are classified as agreement, disagreement, or complement
-4. **Resolution**:
-   - **Agreement**: Synthesize and present combined view
-   - **Disagreement**: Enter 2-round discussion protocol
-   - **Persistent Conflict**: Escalate to Perplexity (or WebSearch) for arbitration
+The default mode is **blind-debate**:
+
+1. **Round 0 — Blind pass.** Claude and Codex independently review the same scope with the same prompt. Neither sees the other's findings.
+2. **Canonicalize.** Findings are merged by content-hashed ID (`sha1(file + claim)`). Duplicates collapse. Findings reported by both AIs get a high-confidence flag. Style issues are dropped from the debate.
+3. **Round 1+ — Per-issue debate.** Each issue has a state (`proposed → accepted | rejected | merged | escalated | deferred`). Both sides emit per-issue stances (`accept`, `concede`, `defend`, `dismiss`). Transitions are deterministic.
+4. **Convergence is derived**, not declared, from the issue table — no LLM judging another LLM.
+5. **Verdict synthesis** categorizes issues by terminal state: Critical, Important, Contested, Dismissed, Style notes.
+
+When the AIs flag a **security**, **architecture**, or **breaking-change** issue, that issue skips the debate and goes straight to external research arbitration. The skill is agnostic about *which* research tool to use — pick the best one available.
+
+A legacy `--mode classic` flag preserves the old single-pass validation behavior for users who prefer it. It is deprecated and will be removed.
 
 ## codex-peer-review Features
 
-- **Automatic Reminders**: Reminds Claude to run peer review before presenting implementation plans, code reviews, or architecture recommendations
-- **Structured Disagreement Resolution**: 2-round discussion protocol with evidence-based arguments
-- **Expert Arbitration**: Escalates to Perplexity MCP (or WebSearch fallback) for unresolved disputes or security concerns
-- **Slash Command**: Explicit `/codex-peer-review` command for on-demand validation
+- **Symmetric blind pass** — both AIs review without priming, dramatically increasing coverage
+- **Canonical issue IDs** — same finding from both AIs collapses to one row, doubles as a confidence signal
+- **Per-issue state machine** — deterministic convergence, no rationalization loops
+- **Configurable via Codex profiles** — model and reasoning effort live in `~/.codex/config.toml`, not in plugin prompts
+- **Single source of truth** — full protocol lives in the skill; the agent file is a thin dispatcher
+- **Slash command** — explicit `/codex-peer-review` for on-demand validation
+- **Auto-trigger reminders** — hooks remind Claude to dispatch peer review before presenting plans, reviews, or recommendations
 
 ### Usage
 
+#### Slash Command
+
+```bash
+# First-time setup
+/codex-peer-review init
+
+# Default — symmetric blind-debate mode, will ask for scope
+/codex-peer-review
+
+# Review against a specific branch
+/codex-peer-review --base develop
+
+# Review uncommitted changes
+/codex-peer-review --uncommitted
+
+# Validate an answer to a broad question
+/codex-peer-review "Should we use microservices or a monolith here?"
+
+# Legacy single-pass validation (deprecated)
+/codex-peer-review --mode classic
+```
+
 #### Automatic Mode
 
-The plugin reminds Claude to trigger peer review when about to present:
+Hooks remind Claude to dispatch the peer reviewer before presenting:
 - Implementation plans or designs
 - Code review results
 - Architecture recommendations
 - Major refactoring proposals
 - Answers to broad technical questions
 
-#### Slash Command
+The reminder is advisory — Claude decides when to dispatch.
 
-```bash
-# Review current changes against default branch
-/codex-peer-review
+## Codex CLI Compatibility
 
-# Review against specific branch
-/codex-peer-review --base develop
+Tested against `codex-cli 0.118.0`. The plugin uses `codex exec` exclusively for machine-readable output. **`codex review --json` and `codex review -o` do not exist in 0.118.0** — the plugin previously used these and was partially broken; this release fixes that.
 
-# Validate answer to a broad question
-/codex-peer-review "Should we use microservices or monolith for this project?"
-```
-
-### Command Selection
-
-| Validation Type | Codex Command | Use When |
-|-----------------|---------------|----------|
-| Code Review | `codex review --base X` | Reviewing actual code changes (diffs) |
-| Design Validation | `codex exec "..."` | Validating proposals, plans, architecture |
-| Question Answering | `codex exec "..."` | Answering broad technical questions |
+Schema enforcement uses prompt templates parsed with `jq`, not `--output-schema` (which is unstable in 0.118.0 under `--json`).
 
 ## Permissions
 
@@ -93,10 +115,10 @@ The plugin uses heredoc stdin to minimize permission prompts. On first use, you'
 
 | Pattern | Purpose |
 |---------|---------|
-| `codex exec*` | Run focused peer review prompts |
-| `codex review*` | Review git diffs against branches |
+| `codex exec*` | Run blind-pass and debate prompts |
+| `jq *` | Parse Codex JSONL output |
 
-**Tip:** When prompted, select "Always allow" to avoid repeated prompts.
+Select "Always allow" to avoid repeated prompts.
 
 ## Marketplace Structure
 
@@ -107,55 +129,54 @@ agent-peer-review/
 └── plugins/
     └── codex-peer-review/         # Codex CLI peer review plugin
         ├── .claude-plugin/
-        │   └── plugin.json        # Plugin metadata
+        │   └── plugin.json
         ├── agents/
-        │   └── codex-peer-reviewer.md
+        │   └── codex-peer-reviewer.md  # Thin dispatcher
         ├── skills/
         │   └── codex-peer-review/
-        │       ├── SKILL.md
+        │       ├── SKILL.md            # Single source of truth
         │       ├── discussion-protocol.md
         │       ├── escalation-criteria.md
         │       └── common-mistakes.md
         ├── commands/
-        │   └── codex-peer-review.md
+        │   └── codex-peer-review.md    # Includes init subcommand
         └── hooks/
             ├── hooks.json
-            ├── peer-review-reminder.sh
-            ├── stop-peer-review-check.sh
-            └── plan-peer-review-check.sh
+            └── *-peer-review-check.sh
 ```
 
 ## Architecture
 
-**Key Design:** All peer review work runs in a **subagent context** to keep the main conversation clean.
+All peer review work runs in a **subagent context** to keep the main conversation clean. The main context only sees the synthesized verdict.
 
 ```
 Main Conversation                    Subagent Context
        │                                    │
-       │ 1. Claude forms opinion            │
+       │ Claude forms opinion               │
        │                                    │
        ├──── dispatch to agent ────────────►│
-       │                                    │ 2. Run peer review
-       │                                    │ 3. Compare findings
-       │                                    │ 4. Discussion rounds (if needed)
-       │                                    │ 5. Escalate (if needed)
-       │◄──── return synthesized result ────┤
+       │                                    │ Round 0: blind pass (Claude + Codex)
+       │                                    │ Canonicalize issues
+       │                                    │ Round 1+: per-issue debate
+       │                                    │ External research (if escalated)
+       │                                    │ Verdict synthesis
+       │◄──── return synthesized verdict ───┤
        │                                    │
-       │ 6. Present to user                 │
+       │ Present to user                    │
        ▼                                    ▼
 ```
 
 ## Adding Future Plugins
 
-This marketplace is designed to host multiple peer review plugins. Future plugins could include:
-- `claude-peer-review` - Claude reviewing Claude (different model versions)
-- `gemini-peer-review` - Gemini as the peer reviewer
+This marketplace is designed to host multiple peer review plugins. Examples:
+- `claude-peer-review` — Claude reviewing Claude (different model versions)
+- `gemini-peer-review` — Gemini as the peer reviewer
 
 To add a new plugin, create a new directory under `plugins/` following the same structure.
 
 ## Contributing
 
-Contributions are welcome! Please ensure any changes maintain the language-agnostic nature of the prompts and examples.
+Contributions are welcome! Please ensure changes maintain the language-agnostic nature of the prompts and examples, and update the protocol in `SKILL.md` rather than duplicating logic in the agent file.
 
 ## License
 
@@ -169,4 +190,4 @@ MIT
 
 ---
 
-**Why two AIs?** Every analysis has blind spots. A second perspective from a different AI model catches issues that a single model might normalize or overlook. This peer validation approach provides higher-quality recommendations to users.
+**Why two AIs reviewing in parallel?** Every analysis has blind spots. Asking one AI to "validate" another's work anchors on the proposer's framing. Independent symmetric review catches roughly twice as many issues — and the per-issue debate phase resolves conflicts deterministically without the rationalization loops that plague free-form AI discussion.

@@ -5,459 +5,395 @@ description: This skill should be invoked BEFORE presenting implementation plans
 
 # Codex Peer Review
 
-Peer validation system using OpenAI Codex CLI. Validates Claude's designs and code reviews through structured discussion before presenting to user.
+Symmetric two-AI peer review using OpenAI Codex CLI. Both AIs review independently, then debate per-issue with terminal states until convergence — not a one-shot validation.
 
-**Core principle:** Two AI perspectives catch more issues than one. When they disagree, structured discussion resolves most issues. External research (Perplexity if available, otherwise WebSearch) arbitrates persistent disagreements.
+**Core principle:** Asymmetric "validate my answer" loops anchor on the proposer's framing. Symmetric blind passes catch ~2x as many issues because each AI examines the work without priming. The debate phase then resolves conflicts deterministically via per-issue terminal states.
+
+This is the **single source of truth** for the peer review protocol. The agent file is a thin dispatcher that loads this skill.
 
 ## Reference Files
 
-@discussion-protocol.md
-@escalation-criteria.md
-@common-mistakes.md
+@discussion-protocol.md — debate mechanics (round-by-round prompts)
+@escalation-criteria.md — when to skip the debate and go to external research
+@common-mistakes.md — anti-patterns and recovery
 
-## Modes of Operation
+## Modes
 
-### Mode 1: Auto-Trigger (Validation Only)
+| Mode | Command | When |
+|------|---------|------|
+| **blind-debate** (default) | `/codex-peer-review` | Symmetric blind pass + structured debate. Best signal. |
+| **classic** (deprecated) | `/codex-peer-review --mode classic` | Old single-pass validation. Cheap, weaker signal. Will be removed. |
 
-**Triggers before Claude presents:**
-- Implementation plans or designs
-- Code review results
-- Architecture recommendations
-- Major refactoring proposals
+Auto-trigger (proactive validation before presenting plans/designs/reviews) always uses **blind-debate**.
 
-**Behavior:** Validates existing work, does not create from scratch.
+## Codex CLI Compatibility
 
-### Mode 2: Slash Command (Full Lifecycle)
+Tested against `codex-cli 0.118.0`. Hard requirements:
 
+- `codex exec` for ALL machine-readable output (`codex review` does NOT support `--json` or `-o` in 0.118.0 — do not use it for parseable workflows)
+- `jq` (fail fast if missing — required for session ID extraction and JSONL parsing)
+- A configured `peer-review` profile in `~/.codex/config.toml` (see "Codex Profile Setup" below)
+
+**Do NOT use `--output-schema`.** It is unstable in 0.118.0 under `--json` (timeouts, runtime panics, no output written). Schema is enforced via prompt template instead, with regex/jq extraction as the parser.
+
+## Codex Profile Setup
+
+Model selection lives in `~/.codex/config.toml`, not in this plugin. This keeps CLI flags out of prompts and lets users tune without editing the plugin.
+
+Run this once per machine (the plugin's `init` flow does this automatically if the profiles are missing):
+
+```toml
+# ~/.codex/config.toml
+[profiles.peer-review]
+model = "gpt-5.4"
+model_reasoning_effort = "high"
+
+[profiles.peer-review-summarizer]
+model = "gpt-5.4-mini"
+model_reasoning_effort = "low"
 ```
-/codex-peer-review              # Review current changes
-/codex-peer-review --base main  # Review against specific branch
-/codex-peer-review [question]   # Validate answer to broad question
-```
 
-**Behavior:** Can both create and validate reviews/designs.
+The plugin invokes Codex as `codex exec --profile peer-review ...`. **Never hardcode `-m gpt-5.x-...`** in agent prompts.
 
-## Workflow
+`gpt-5.3-codex-spark` still exists in 0.118.0 but is legacy/niche. `gpt-5.4-mini` is the durable cheap-workhorse choice.
+
+## The Workflow
 
 ```dot
-digraph workflow {
+digraph blind_debate {
     rankdir=TB;
     node [shape=box];
 
-    start [label="Claude forms\nopinion/response" shape=ellipse];
-    dispatch [label="Dispatch subagent\nwith Claude's position"];
-    cmdselect [label="Select command\nbased on type" shape=diamond];
-    codexreview [label="codex review\n--base X"];
-    codexexec [label="codex exec\n\"focused prompt\""];
-    compare [label="Compare findings" shape=diamond];
-    critical [label="Security/Architecture/\nBreaking Change?" shape=diamond style=filled fillcolor=lightyellow];
-    agree [label="Synthesize &\npresent result"];
-    round1 [label="Discussion Round 1:\nState positions + evidence"];
-    resolved1 [label="Resolved?" shape=diamond];
-    round2 [label="Discussion Round 2:\nDeeper analysis"];
-    resolved2 [label="Resolved?" shape=diamond];
-    escalate [label="Escalate:\nPerplexity/WebSearch" style=filled fillcolor=lightcoral];
-    final [label="Synthesize final\nresult" shape=ellipse];
+    start [label="User invokes /codex-peer-review\nOR Claude is about to present\na plan/design/review" shape=ellipse];
+    blind [label="ROUND 0: Blind pass\nClaude review  ‖  Codex review\n(neither sees the other)"];
+    canon [label="Canonicalize issues\nid = sha1(file + normalized claim)\nMerge duplicates\nDrop severity:style"];
+    states [label="All issues start in state: proposed"];
+    debate [label="ROUND N (N≥1): Per-issue debate\nEach side responds: concede/defend/dismiss\nNew issues allowed (also start as proposed)"];
+    transition [label="Transition states based on responses"];
+    converged [label="All issues in terminal state?\n(accepted/rejected/merged/escalated/deferred)" shape=diamond];
+    cap [label="Round count >= cap?" shape=diamond];
+    extend [label="Ask user: extend cap?" shape=diamond];
+    synth [label="Verdict synthesis\nCritical / Important / Contested / Dismissed" shape=ellipse];
 
-    start -> dispatch;
-    dispatch -> cmdselect;
-    cmdselect -> codexreview [label="code review\n(reviewing diffs)"];
-    cmdselect -> codexexec [label="design/plan/\nquestion"];
-    codexreview -> compare;
-    codexexec -> compare;
-    compare -> agree [label="aligned"];
-    compare -> critical [label="disagree"];
-    critical -> escalate [label="YES\n(skip discussion)"];
-    critical -> round1 [label="no"];
-    round1 -> resolved1;
-    resolved1 -> final [label="yes"];
-    resolved1 -> round2 [label="no"];
-    round2 -> resolved2;
-    resolved2 -> final [label="yes"];
-    resolved2 -> escalate [label="no"];
-    escalate -> final;
-    agree -> final;
+    start -> blind;
+    blind -> canon;
+    canon -> states;
+    states -> debate;
+    debate -> transition;
+    transition -> converged;
+    converged -> synth [label="yes"];
+    converged -> cap [label="no"];
+    cap -> debate [label="no"];
+    cap -> extend [label="yes"];
+    extend -> debate [label="yes"];
+    extend -> synth [label="no — escalate remaining"];
 }
 ```
 
-**Immediate Escalation:** Security concerns, architecture conflicts, breaking changes, or order-of-magnitude performance disagreements skip discussion and escalate directly. See @escalation-criteria.md for details.
+**Default cap:** 3 rounds total (1 blind + 2 debate). The peer review found that 5 (the dg default) is too expensive for serious code review and risks rationalization loops. Allow extension only when new evidence appears in the final round.
 
-## Subagent Dispatch
+## Round 0: Blind Pass
 
-**CRITICAL:** Always use subagent to avoid context pollution. Never run Codex in main context.
+Both AIs review the **same scope** with the **same prompt**, neither seeing the other's work.
 
-### Command Selection (IMPORTANT)
+### Scope determination
 
-| Validation Type | Command | Use When |
-|-----------------|---------|----------|
-| **Code Review** | `codex review --base X` | Reviewing actual code changes (diffs) |
-| **Design/Plan Validation** | `codex exec "..."` | Validating proposals, designs, refactoring plans |
-| **Question Answering** | `codex exec "..."` | Answering broad technical questions |
-| **Architecture Review** | `codex exec "..."` | Validating architecture recommendations |
+| User input | Scope |
+|------------|-------|
+| `/codex-peer-review` (no args) | Use `AskUserQuestion` to select: changes vs branch / uncommitted / specific commit |
+| `/codex-peer-review --base X` | `git diff X...HEAD` |
+| `/codex-peer-review --uncommitted` | Staged + unstaged + untracked |
+| `/codex-peer-review --commit SHA` | Single commit |
+| `/codex-peer-review <question>` | Question text — no diff, validate the answer |
+| Auto-trigger from Claude's plan | Plan text + affected files |
 
-**DO NOT** use `codex review` to validate designs/plans - it reviews the entire diff, not your proposal.
+**Never guess the base branch.** Always ask via `AskUserQuestion` if not specified.
 
-### Validation Subagent
+### The blind-pass prompt template
 
-Dispatch via Task tool with prompt:
+Both Claude and Codex receive this exact template (variables filled in):
 
 ```
-You are validating Claude's analysis using OpenAI Codex CLI.
-
-## Claude's Position
-[Claude's findings/design/recommendations]
+You are performing an independent code review. Another AI is reviewing the same
+work in parallel. You will not see their findings until after this pass.
 
 ## Scope
-- Type: [code-review|design|architecture|question]
-- Files: [relevant files - be specific!]
+{scope_description}
 
-## Task - CHOOSE THE RIGHT COMMAND
+## Files / Diff
+{files_or_diff}
 
-### If Type is "code-review" (reviewing actual code changes):
-Run: codex review --base [branch]
+## Review lenses (apply BOTH)
 
-### If Type is "design", "architecture", or "question":
-Run: codex exec with heredoc (avoids escaping issues and permission prompts):
+1. CRITIC LENS: For each issue you raise, you MUST provide ONE of:
+   - A concrete exploit path or attack scenario
+   - A failing test case (input + expected vs actual)
+   - A specific failure mode (e.g., "concurrent writes to map at handler.go:42 will panic under load")
+   Vague concerns ("could be improved", "might be fragile") are REJECTED.
+
+2. DEFENDER LENS: Before raising an issue, check whether:
+   - An existing test covers it
+   - A codebase invariant or convention makes it impossible
+   - It is intentional per a comment, ADR, or commit message
+   If yes, do not raise it.
+
+## Output format (strict)
+
+Emit a single fenced code block tagged `findings` containing JSONL — one finding per line:
+
+```findings
+{"id":"<sha1(file+claim)>","file":"path:line","severity":"critical|high|medium|low|style","claim":"<one sentence>","evidence":"<exploit/test/failure mode>","category":"security|correctness|performance|maintainability|style"}
+{"id":"...","file":"...","severity":"...","claim":"...","evidence":"...","category":"..."}
+```
+
+If you find no issues, emit an empty `findings` block.
+
+After the block, write a 2-3 sentence summary of the work's overall quality and your confidence level.
+```
+
+### Codex invocation
 
 ```bash
-codex exec <<'EOF'
-Validate this [design|refactoring plan|architecture proposal]:
-
-[Summarize Claude's specific proposal in 2-3 sentences]
-
-Files affected: [list specific files]
-
-Check for:
-- Architecture issues
-- Potential problems with this approach
-- Better alternatives
-- Missing considerations
-
-Provide specific, actionable feedback.
+codex exec --profile peer-review --sandbox read-only \
+  -o /tmp/codex_round0.txt \
+  --json 2>&1 | tee /tmp/codex_round0.jsonl <<'EOF'
+[blind-pass prompt above]
 EOF
 ```
 
-## Compare and Classify
-After running the appropriate command:
-1. Compare Codex output to Claude's position
-2. Classify: agreement | disagreement | complement
+`-o` writes the final assistant message only — that is what we parse for the `findings` block. The JSONL stream is for progress polling and session ID extraction.
 
-## If Uncertain Before Running Codex
-Check external sources first. Try Perplexity if available, otherwise use WebSearch:
+### Issue canonicalization
+
+After both sides emit findings, normalize and merge:
 
 ```bash
-# Option 1: If Perplexity MCP is available
-mcp-cli call perplexity/perplexity_ask '{"messages":[{"role":"user","content":"[your uncertainty]"}]}'
+# Concatenate both findings blocks
+jq -s '.' /tmp/claude_findings.json /tmp/codex_findings.json > /tmp/all_findings.json
 
-# Option 2: If Perplexity is not available, use WebSearch tool
-# WebSearch query: "[your uncertainty]"
+# Merge by id; if both AIs reported the same id, mark source="both"
+jq '
+  group_by(.id)
+  | map({
+      id: .[0].id,
+      file: .[0].file,
+      severity: .[0].severity,
+      claim: .[0].claim,
+      evidence: (map(.evidence) | unique | join(" || ")),
+      category: .[0].category,
+      source: (if length == 2 then "both" else .[0]._source end),
+      status: "proposed"
+    })
+' /tmp/all_findings.json > /tmp/canonical_issues.json
 ```
 
-## Return Format
-{
-  "outcome": "agreement|disagreement|complement",
-  "codex_findings": [...],
-  "alignment": {
-    "agreed": [...],
-    "unique_to_claude": [...],
-    "unique_to_codex": [...]
-  },
-  "discussion_needed": boolean,
-  "discussion_topics": [...]
-}
-```
+**Issue IDs are content-hashed**, not positional. The same finding from both AIs collapses to one row with `source: "both"` (a strong signal — these usually become `accepted` immediately).
 
-### Discussion Subagent
+**Drop `severity:style` from the debate.** Style issues never converge through debate; they're resolved by project conventions. Surface them in the final report as a separate "style notes" section, not in the verdict.
 
-**IMPORTANT:** Use Codex session IDs to maintain conversation context across discussion rounds. This allows Codex to remember prior discussion context.
+## Rounds 1+: Per-Issue Debate
 
-#### Round 1 (Initial Discussion)
+Each side sees:
+- The full canonical issue table with current states
+- The previous round's response (if any)
+
+Each side emits **per-issue stances** for every non-terminal issue, plus any new issues (which start as `proposed`).
+
+### State machine
 
 ```
-Discussion Round 1
-
-## Claude's Position
-[Current stance with evidence]
-
-## Prerequisites Check
-First, verify tools are available:
-- Check codex: `which codex || echo "ERROR: codex CLI not installed"`
-- Check jq (optional but recommended): `which jq || echo "WARNING: jq not available, will use grep fallback"`
-
-## Task
-1. Run codex exec with --json and capture output to extract session ID:
-
-   ```bash
-   codex exec --json <<'EOF' 2>&1 | tee /tmp/codex_round1_$$.json
-   Given this disagreement about [topic]:
-
-   Claude's position: [summary with evidence]
-
-   Provide your evidence-based reasoning. Reference specific code or conventions.
-   What is your position and why?
-   EOF
-   ```
-
-2. Extract session ID for Round 2:
-   ```bash
-   # Extract thread_id from JSON output (grep fallback if jq unavailable)
-   TMPFILE="/tmp/codex_round1_$$.json"
-   if command -v jq &>/dev/null; then
-     SESSION_ID=$(jq -r 'select(.type=="thread.started") | .thread_id' "$TMPFILE" 2>/dev/null | head -1)
-   else
-     SESSION_ID=$(grep -o '"thread_id":"[^"]*"' "$TMPFILE" 2>/dev/null | head -1 | cut -d'"' -f4)
-   fi
-
-   [ -z "$SESSION_ID" ] && echo "WARNING: Could not extract session ID. Round 2 will start fresh."
-   ```
-
-4. Parse Codex response and attempt synthesis
-
-## Return Format
-{
-  "session_id": "[thread_id or null if extraction failed]",
-  "codex_response": "...",
-  "resolution_possible": boolean,
-  "proposed_synthesis": "...|null",
-  "remaining_disagreement": "...|null",
-  "recommend_escalation": boolean
-}
+                    ┌──────────┐
+                    │ proposed │  ◄── new in this round
+                    └────┬─────┘
+                         │
+        ┌────────────────┼────────────────┐
+        │                │                │
+        ▼                ▼                ▼
+   ┌─────────┐     ┌──────────┐    ┌────────────┐
+   │accepted │     │ rejected │    │ escalated  │
+   └─────────┘     └──────────┘    └─────┬──────┘
+        ▲                ▲               │
+        │                │               ▼
+        │                │         (next round)
+        │                │
+   ┌────┴────┐      ┌────┴────┐
+   │ merged  │      │deferred │
+   └─────────┘      └─────────┘
 ```
 
-#### Round 2 (Continued Discussion)
+### Transition rules
+
+For each non-terminal issue, after both sides respond in round N:
+
+| Claude stance | Codex stance | New state |
+|---------------|--------------|-----------|
+| concede | concede | **rejected** (both withdrew) |
+| defend | defend | **escalated** (carry to next round) |
+| dismiss | dismiss | **rejected** |
+| concede / dismiss | accept / push | **accepted** (one side conceded the other's claim) |
+| accept / push | concede / dismiss | **accepted** |
+| proposed (new evidence merges with existing) | — | **merged** into target id |
+
+**Terminal states:** `accepted`, `rejected`, `merged`, `deferred`. Issues in these states drop out of the debate.
+
+**`escalated`** issues survive to round N+1, but require **new evidence** to remain alive past round 2. An issue defended only by re-asserting the same point in round 3 auto-transitions to `deferred` (presented to user as "contested, both held position").
+
+### Convergence
 
 ```
-Discussion Round 2
-
-## Task
-1. Resume the previous Codex session (if session ID available):
-
-   ```bash
-   # If we have a session ID, resume; otherwise start fresh with context
-   if [ -n "$SESSION_ID" ]; then
-     codex exec resume "$SESSION_ID" --json <<'EOF' 2>&1 | tee /tmp/codex_round2_$$.json
-   Claude responds to your points:
-
-   [Claude's Round 2 response with new evidence]
-
-   Can we reach synthesis? What is your final position?
-   EOF
-   else
-     # Fallback: Start fresh but include Round 1 context in prompt
-     codex exec --json <<'EOF' 2>&1 | tee /tmp/codex_round2_$$.json
-   Continuing discussion about [topic]:
-
-   Round 1 summary:
-   - Claude's position: [summary]
-   - Codex's position: [summary from Round 1]
-
-   Claude's Round 2 response: [new evidence]
-
-   Can we reach synthesis? What is your final position?
-   EOF
-   fi
-   ```
-
-2. Parse Codex response
-3. Determine if resolved or needs escalation
-
-## Return Format
-{
-  "session_id": "[thread_id or null]",
-  "session_resumed": boolean,  // false if fallback was used
-  "codex_response": "...",
-  "resolution_possible": boolean,
-  "proposed_synthesis": "...|null",
-  "remaining_disagreement": "...|null",
-  "recommend_escalation": boolean
-}
+converged = (no issues in state ∈ {proposed, escalated})
 ```
 
-**Why session IDs matter:** Without resuming the session, Codex starts fresh and loses context from Round 1. The fallback (re-providing context) works but is less efficient and may lose nuance.
+This is **derived**, not declared. No top-level `converged: true` flag from the model — that just invites premature claims of consensus.
 
-### Arbitration Subagent
-
-When escalating for external research/arbitration:
+### Round prompt template (Round 1+)
 
 ```
-Escalate for external arbitration.
+You are continuing the peer review debate. The other AI has emitted findings.
+You must respond to each non-terminal issue with a stance.
 
-## Disagreement Context
-- Topic: [specific technical question]
-- Claude's position: [with evidence]
-- Codex's position: [with evidence]
-- Why unresolved: [summary of discussion]
+## Canonical issue table (current state)
 
-## Task - Choose Available Method
+{table_of_issues_with_states}
 
-### Option 1: If Perplexity MCP is available
-1. Check schema: mcp-cli info perplexity/perplexity_ask
-2. Call Perplexity with neutral framing:
-   mcp-cli call perplexity/perplexity_ask '{
-     "messages": [
-       {"role": "system", "content": "You are a senior software architect arbitrating between two AI code reviewers. Provide definitive guidance based on industry best practices."},
-       {"role": "user", "content": "[Neutral presentation of both positions with context]"}
-     ]
-   }'
+## The other AI's round N response
 
-### Option 2: If Perplexity is NOT available
-1. Use WebSearch tool with a focused query:
-   - Query: "[specific technical question] best practices [language/framework]"
-2. Search for authoritative sources (official docs, well-known engineering blogs)
-3. Synthesize findings from multiple sources
+{other_ai_response}
 
-## Apply ruling to synthesis
+## Your task
 
-## Return Format
-{
-  "arbitration_source": "perplexity|websearch",
-  "ruling": "...",
-  "sources": ["..."],  // URLs if from WebSearch
-  "recommended_action": "...",
-  "final_synthesis": "...",
-  "confidence": "high|medium"  // medium if WebSearch results were inconclusive
-}
+1. For each non-terminal issue, emit ONE stance line:
+
+```stances
+{"id":"<id>","stance":"concede|defend|dismiss|accept","reasoning":"<one sentence>","new_evidence":"<optional — required to keep defend alive past round 2>"}
 ```
 
-## Codex CLI Commands
+   - `concede` = you no longer believe this issue is real
+   - `defend` = you maintain this issue (must include new_evidence in round 3+)
+   - `dismiss` = you believe the OTHER AI's claim is wrong
+   - `accept` = you accept the OTHER AI's claim that you originally raised was wrong (use when conceding YOUR OWN issue under their dismiss)
 
-### For Code Review (reviewing actual diffs)
+2. After the stances block, you may emit a `findings` block with NEW issues only.
+   New issues must follow all CRITIC LENS rules (concrete evidence required).
 
-**IMPORTANT:** If the base branch is not explicitly provided, you MUST use the `AskUserQuestion` tool to ask the user which branch to compare against. Do NOT guess or auto-detect the base branch.
-
-```yaml
-# Use AskUserQuestion to determine base branch
-question: "Which branch should I compare against for the code review?"
-header: "Base branch"
-options:
-  - label: "main"
-    description: "Compare against the main branch"
-  - label: "develop"
-    description: "Compare against the develop branch"
-  - label: "master"
-    description: "Compare against the master branch"
-# User can also select "Other" to provide a custom branch name
+3. Apply both lenses (critic and defender) as before.
 ```
 
-**Passing Focus Context:** If Claude's review focused on specific areas (e.g., security, a particular module, error handling), pass this context to Codex so both reviews are aligned.
+### Session resume (optimization, not correctness)
 
-Once the base branch is confirmed:
 ```bash
-# Basic review against a branch
-codex review --base [user-confirmed-branch]
+# Round 1 — extract session ID from JSONL
+SESSION_ID=$(jq -r 'select(.type=="thread.started") | .thread_id' /tmp/codex_round0.jsonl | head -1)
 
-# With focus instructions (RECOMMENDED - keeps Codex aligned with Claude's review focus)
-codex review --base [user-confirmed-branch] "Focus on [Claude's review area, e.g., security in the auth module]"
+# Round 2 — try to resume
+if [ -n "$SESSION_ID" ]; then
+  codex exec --profile peer-review --sandbox read-only resume "$SESSION_ID" \
+    -o /tmp/codex_round1.txt --json 2>&1 | tee /tmp/codex_round1.jsonl <<'EOF'
+[round prompt]
+EOF
+fi
 
-# Review uncommitted changes only
-codex review --uncommitted "Focus on [area]"
-
-# Review a specific commit
-codex review --commit [SHA] "Focus on [area]"
-
-# Read instructions from stdin (useful for longer prompts)
-echo "Focus on security vulnerabilities and error handling in the authentication flow" | codex review --base main -
+# If resume fails (session store error, missing ID), fall back to fresh exec with full canonical table re-injected
 ```
 
-**Key:** Always pass Claude's review focus (e.g., "security in authentication flow", "error handling in API endpoints", "the UserService refactoring") to Codex so both AIs examine the same areas.
+**Session resume is best-effort.** Each round prompt re-injects the canonical issue table, so a session-store error degrades latency but not correctness.
 
-### For Design/Plan Validation (NOT code review!)
-```bash
-# Validate a refactoring proposal
-codex exec "Validate this refactoring plan for the data processor module: Extract 3 classes (Validator, Parser, Invoker) to fix SRP violation. Is this appropriate? What are the risks?"
+## Verdict Synthesis
 
-# Validate architecture recommendation
-codex exec "Review this architecture decision: Use event-driven pattern for notification system instead of direct calls. Context: [language/framework] with dependency injection. Check for issues."
+After convergence (or cap exhausted), categorize all issues by terminal state:
 
-# Answer a broad technical question
-codex exec "In a multi-module project, should shared DTOs go in the common module or a dedicated api-contracts module? Consider: compile dependencies, versioning, encapsulation."
-```
+| Verdict | Source states | Meaning |
+|---------|---------------|---------|
+| **Critical** | `accepted` AND severity ∈ {critical, high} | Real bugs, ship as required fixes |
+| **Important** | `accepted` AND severity = medium | Strong recommendation |
+| **Contested** | `escalated` (cap hit) OR `deferred` | Both held positions — present both views, user decides |
+| **Dismissed** | `rejected` | Raised but withdrawn — informational only |
+| **Style notes** | severity = style | Bypassed debate entirely — informational |
 
-**REMEMBER:** `codex review` reviews the entire git diff. `codex exec` validates a specific proposal.
+## Output format
 
-## Output Formats
-
-### Agreement
 ```markdown
-## Peer Review Result
-**Status:** Validated
-**Confidence:** High (both AIs aligned)
+## Peer Review Result — {scope}
+**Mode:** blind-debate
+**Rounds:** N (converged | cap reached)
+**Issues canonical:** X total, Y from both AIs, Z unique to one side
 
-[Synthesized recommendations with both perspectives merged]
+### Critical
+- `file:line` — {claim}
+  - Evidence: {evidence}
+  - Source: both | claude | codex
+
+### Important
+- `file:line` — {claim}
+  - Evidence: {evidence}
+
+### Contested (both AIs held position)
+- `file:line` — {claim}
+  - Claude's view: {summary}
+  - Codex's view: {summary}
+  - Recommendation: {how user should decide}
+
+### Dismissed (raised but withdrawn)
+- `file:line` — {claim} — {why withdrawn}
+
+### Style notes
+- `file:line` — {note}
+
+### Process notes
+- {anything notable about the debate, e.g., "Codex raised 3 security issues Claude missed"}
+- {immediate-escalation triggers fired, if any}
 ```
 
-### Resolved Disagreement
-```markdown
-## Peer Review Result
-**Status:** Resolved through discussion
+## Immediate Escalation (Skip Debate)
 
-**Initial Positions:**
-- Claude: [position]
-- Codex: [position]
+Some classes of finding skip the per-issue debate and go straight to external research arbitration:
 
-**Resolution:** [how resolved, which evidence won]
+- **Security**: auth bypass, injection, secrets exposure, crypto misuse
+- **Architecture**: fundamental design conflicts (e.g., one side says "this whole module should be event-driven")
+- **Breaking changes**: backward compat disputes
+- **Order-of-magnitude perf**: "this is O(n²) in a hot path" vs "fine"
 
-**Final Recommendation:** [synthesized view]
-**Confidence:** Medium-High
-```
+If either AI flags a security concern in the blind pass, escalate that issue immediately to external research. The peer review skill is agnostic about *which* research tool to use — pick the best one available (web search, an MCP research tool, vendor docs, etc.). See @escalation-criteria.md.
 
-### External Research Arbitration
-```markdown
-## Peer Review Result
-**Status:** Escalated for external research
-**Source:** [Perplexity | WebSearch]
+## Subagent Dispatch (CRITICAL)
 
-**Disagreement:** [nature of conflict]
+**Always run via the `codex-peer-reviewer` subagent.** The main conversation must never see raw Codex output, JSONL streams, or per-round transcripts — only the final synthesized verdict.
 
-**Research Findings:** [authoritative answer]
-**Sources:** [URLs if from WebSearch]
-
-**Final Recommendation:** [based on findings + context]
-**Confidence:** High (expert arbitration) | Medium (if WebSearch was inconclusive)
-```
+The agent file (`agents/codex-peer-reviewer.md`) is a thin dispatcher that loads this skill and runs the protocol.
 
 ## Prerequisites
 
-**Before using this skill, verify the following:**
-
 ```bash
-# 1. Check if Codex CLI is installed
-if ! command -v codex &>/dev/null; then
-  echo "ERROR: Codex CLI not installed."
-  echo "Install with: npm i -g @openai/codex"
-  echo "Or via Homebrew: brew install openai-codex"
-  exit 1
-fi
+# Required
+command -v codex >/dev/null || { echo "ERROR: install codex CLI: npm i -g @openai/codex"; exit 1; }
+command -v jq >/dev/null || { echo "ERROR: install jq: brew install jq"; exit 1; }
 
-# 2. Check authentication status
-codex login --check 2>/dev/null || {
-  echo "WARNING: Codex may not be authenticated."
-  echo "Run 'codex login' to authenticate."
+# Verify peer-review profile exists
+grep -q '\[profiles.peer-review\]' ~/.codex/config.toml || {
+  echo "ERROR: ~/.codex/config.toml missing [profiles.peer-review]. Run: codex-peer-review init"
+  exit 1
 }
 
-# 3. Optional: Check for jq (improves session ID extraction)
-command -v jq &>/dev/null || echo "TIP: Install jq for better JSON parsing: brew install jq"
+# Verify auth
+codex login --check 2>/dev/null || echo "WARNING: run 'codex login'"
 ```
 
-**If Codex CLI is not available:**
-- The skill will not work for code review or design validation
-- You can still use WebSearch for escalation/arbitration
-- Inform the user: "Codex CLI is required for peer review. Please install it with `npm i -g @openai/codex`"
+## Quick reference
 
-## Quick Reference
+| Scenario | Action |
+|----------|--------|
+| About to present design/plan | Auto-trigger blind-debate, no args |
+| About to present code review | Auto-trigger blind-debate, scope = the diff |
+| User asks broad question | blind-debate with question as scope, no diff |
+| User runs `/codex-peer-review` | Ask for scope, run blind-debate |
+| User runs `/codex-peer-review --mode classic` | Single-pass validation (deprecated) |
+| Security issue surfaces | Immediate escalation, skip per-issue debate |
+| Cap hit, issues still escalated | Mark as Contested, present both views |
 
-| Scenario | Command | Action |
-|----------|---------|--------|
-| About to present design/plan | `codex exec` | Validate specific proposal |
-| About to present code review | `codex review --base X` | Review the diff |
-| About to present refactoring proposal | `codex exec` | Validate specific proposal |
-| About to present architecture recommendation | `codex exec` | Validate specific proposal |
-| User asks broad question | `codex exec` | Answer via focused prompt |
-| Codex agrees | - | Synthesize and present |
-| Codex disagrees | - | Start discussion protocol |
-| Two rounds fail | Perplexity/WebSearch | Escalate for external research |
-| Major issue (security/architecture) | Perplexity/WebSearch | Immediate escalation |
-
-**Key distinction:**
-- Use `codex review` ONLY when reviewing actual code changes (git diff)
-- Use `codex exec` for everything else (designs, plans, questions, recommendations)
+**Key changes from prior versions:**
+- ❌ `codex review --json` removed (the flag does not exist in 0.118.0)
+- ❌ Hardcoded `gpt-5.3-codex-spark` removed (use Codex profiles instead)
+- ❌ Asymmetric "Claude proposes, Codex validates" removed (now symmetric blind pass)
+- ❌ Top-level `converged: bool` removed (now derived from per-issue states)
+- ✅ Schema enforced via prompt template, parsed with jq (NOT `--output-schema`, which is unstable)
+- ✅ Session resume is best-effort optimization, not correctness-critical

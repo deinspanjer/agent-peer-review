@@ -1,7 +1,7 @@
 {
   "name": "codex-peer-review",
-  "version": "1.0.12",
-  "description": "Peer validation system using OpenAI Codex CLI. Validates Claude's designs and code reviews through structured discussion before presenting to user.",
+  "version": "2.0.0",
+  "description": "Symmetric two-AI peer review using OpenAI Codex CLI. Both AIs review independently in a blind pass, then debate per-issue with terminal states until convergence. Catches significantly more issues than single-pass validation.",
   "author": {
     "name": "jcputney",
     "url": "https://github.com/jcputney"

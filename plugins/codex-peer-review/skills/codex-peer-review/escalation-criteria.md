@@ -2,11 +2,11 @@
 
 When to escalate disagreements for external research and authoritative resolution.
 
-**Note:** Use Perplexity MCP if available. If Perplexity is not available, use WebSearch tool instead.
+**Note:** This skill is intentionally agnostic about *how* external research happens. Use whatever research capability is available to the host agent — web search, an MCP-provided research tool, documentation lookups, or any combination. Pick the best tool for the question, not a fixed one.
 
-## Immediate Escalation (Skip Discussion)
+## Immediate Escalation (Skip Per-Issue Debate)
 
-These trigger direct escalation to external research - do not attempt discussion rounds:
+These trigger direct escalation to external research — they do not enter the per-issue state machine. The orchestrator detects these in the canonicalized issue table after Round 0 and routes them to arbitration in parallel with the normal debate.
 
 | Category | Examples | Why Skip Discussion |
 |----------|----------|---------------------|
@@ -17,14 +17,14 @@ These trigger direct escalation to external research - do not attempt discussion
 
 **Rule:** If either AI flags a security concern, escalate immediately regardless of the other's opinion.
 
-## Escalation After Discussion
+## Escalation After Per-Issue Debate
 
-After completing 2 discussion rounds, escalate if ANY of these apply:
+After the round cap, any issues still in `escalated` state become `deferred` and are presented as **Contested** in the verdict. If a contested issue is **high-severity**, also trigger external research to give the user a third opinion.
 
-### 1. No Convergence
-- Positions remain fundamentally opposed
-- New evidence in Round 2 didn't shift either position
-- Both AIs maintain high confidence in conflicting views
+### 1. Contested high-severity issues
+- Final state is `deferred`
+- Severity is `high` or `critical`
+- Both AIs maintained position with new evidence each round
 
 ### 2. Low Confidence, High Stakes
 - Neither AI can provide strong evidence
@@ -39,7 +39,7 @@ After completing 2 discussion rounds, escalate if ANY of these apply:
 ### 4. Factual Dispute
 - Disagreement is about verifiable facts
 - One AI might be working from outdated information
-- External research can provide authoritative answer
+- External research can provide an authoritative answer
 
 ## Do NOT Escalate
 
@@ -47,105 +47,108 @@ Reserve external research for genuine disputes. Do not escalate:
 
 | Category | Why Not | Resolution |
 |----------|---------|------------|
-| Minor style disagreements | Not worth expert time | Defer to project conventions |
-| Documentation wording | Subjective preference | Defer to Claude (user context) |
+| Minor style disagreements | Not worth research time | Defer to project conventions |
+| Documentation wording | Subjective preference | Defer to user context |
 | Test coverage thresholds | Project-specific | Use project standards |
 | Naming conventions | Style guide territory | Use project standards |
 | Formatting preferences | Tooling handles this | Use formatter config |
 
-## Escalation Message Templates
+## How to Conduct External Research
 
-When escalating, frame the question neutrally.
+The peer review skill does not prescribe a research backend. The host agent should pick the best tool for the question — web search, MCP-provided research tools, vendor documentation, language/framework specs, or any combination thereof. Whatever tools are available, use them.
 
-### Option 1: Perplexity MCP (if available)
+Two principles regardless of the tool you pick:
 
-```json
-{
-  "messages": [
-    {
-      "role": "system",
-      "content": "You are a senior software architect arbitrating between two AI code reviewers. Provide definitive guidance based on industry best practices and the specific context provided. Be direct and decisive."
-    },
-    {
-      "role": "user",
-      "content": "## Disagreement Context\n\n**Topic:** [specific technical question]\n**Codebase:** [language/framework/version]\n**Project Context:** [relevant constraints or patterns]\n\n**Claude's Position:**\n[position summary]\n- Evidence: [key evidence]\n- Reasoning: [technical reasoning]\n\n**Codex's Position:**\n[position summary]\n- Evidence: [key evidence]\n- Reasoning: [technical reasoning]\n\n**Discussion Summary:**\n[what was tried, why it didn't resolve]\n\n**Question:** Which approach is correct for this situation and why? Please be decisive."
-    }
-  ]
-}
-```
+1. **Frame the question neutrally.** Do not bias the research toward either AI's position.
+2. **Cite your sources.** Capture URLs, doc titles, or tool identifiers so the user can audit the ruling.
 
-### Option 2: WebSearch (if Perplexity not available)
-
-Use the WebSearch tool with focused queries:
+### Neutral question template
 
 ```
-Primary query: "[specific technical question] best practices [language/framework] [year]"
+## Disagreement Context
 
-Follow-up queries if needed:
-- "[Option A approach] vs [Option B approach] [language]"
-- "[specific pattern] official documentation [framework]"
+Topic: [specific technical question]
+Codebase: [language / framework / version]
+Project context: [relevant constraints, conventions, scale]
+
+Position A: [summary]
+- Evidence: [key evidence]
+- Reasoning: [technical reasoning]
+
+Position B: [summary]
+- Evidence: [key evidence]
+- Reasoning: [technical reasoning]
+
+Debate summary: [what was tried, why it didn't resolve]
+
+Question: Which approach is correct for this situation and why?
+What does authoritative documentation, current best practice, or
+production experience say? Be direct and decisive — or, if both
+approaches are defensible, explain the trade-offs explicitly.
 ```
 
-Look for:
-- Official documentation
-- Well-known engineering blogs (Google, Netflix, Uber, etc.)
-- Stack Overflow answers with high votes and recent activity
-- Language/framework RFCs or design documents
+Drop this into whatever research tool you have. The shape is the same regardless of backend.
+
+### What to look for
+
+Prioritize sources in roughly this order, regardless of which tool surfaced them:
+
+1. Official language / framework documentation and RFCs
+2. Vendor or maintainer engineering posts
+3. Well-established engineering blogs (large companies with skin in the game)
+4. Stack Overflow / GitHub issues with high engagement and recent activity
+5. Anything else, treated with appropriate skepticism
+
+A single authoritative source beats five blog posts.
 
 ## Handling External Research Response
 
 ### Accept as Authoritative
 - For this specific case, the research ruling is final
-- Do not re-litigate after receiving response
-- Apply ruling to the synthesis
+- Do not re-litigate after receiving the response
+- Apply the ruling to the verdict
 
 ### Document for Future
 - Note the ruling in the final output
-- Include source URLs when using WebSearch
-- If pattern emerges, consider adding to project standards
-- Help user understand the reasoning
+- Include source URLs / identifiers
+- If a pattern emerges across reviews, consider proposing it as a project convention
 
 ### If Research is Inconclusive
 If external research can't provide a clear answer:
-1. Present both options to user with tradeoffs
+1. Present both options to the user with trade-offs
 2. Note the sources consulted and why they were inconclusive
-3. Let user make final decision
-4. Do not guess or flip a coin
+3. Let the user make the final decision
+4. Do not guess
 
 ## Escalation Flowchart
 
 ```
-Disagreement detected
+Issue surfaces in Round 0 canonical table
         |
         v
-Is it security/architecture/breaking?
+Security / architecture / breaking change?
         |
     Yes |  No
         |   |
         v   v
-   ESCALATE   Start Round 1
-   NOW              |
-                    v
-              Resolved?
-                |
-            Yes | No
-                |  |
-                v  v
-            Done   Round 2
-                      |
-                      v
-                 Resolved?
-                   |
-               Yes | No
-                   |  |
-                   v  v
-               Done   Any major issue
-                      OR no convergence?
-                         |
-                     Yes | No (minor)
-                         |  |
-                         v  v
-                    ESCALATE  Accept
-                    NOW       partial
-                              agreement
+   ESCALATE   Enter per-issue debate
+   in parallel       |
+        |            v
+        |       Round cap reached?
+        |            |
+        |        No  | Yes
+        |        |   |
+        |        v   v
+        |    More    Any escalated → deferred
+        |    rounds       |
+        |                 v
+        |       High-severity & deferred?
+        |             |
+        |         Yes | No
+        |             |  |
+        v             v  v
+   Final synthesis   ESCALATE  Mark as
+   includes          for       Contested
+   research          arbitration in verdict
+   findings
 ```

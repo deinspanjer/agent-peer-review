@@ -1,199 +1,195 @@
-# Discussion Protocol: Claude vs Codex
+# Discussion Protocol: Per-Issue Debate
 
-Structured 2-round resolution of disagreements through evidence-based discussion.
+The `blind-debate` mode resolves disagreements through a per-issue state machine, not free-form rounds. This file documents the mechanics in detail; SKILL.md has the high-level flow.
 
-## Protocol Rules
+## Why per-issue, not per-round
 
-### Rule 1: Evidence Required (When Available)
-Every position should cite evidence from these categories **as applicable**:
-- Specific code lines or files (for code review discussions)
-- Project conventions (from CLAUDE.md or equivalent)
-- Industry best practices (with source)
-- Test results or behavior observations
+The legacy protocol ran whole-conversation rounds with a top-level `resolved/unresolved` boolean. Two problems:
 
-**For design/architecture discussions** where code doesn't exist yet, acceptable evidence includes:
-- Analogous patterns from existing codebase
-- Industry case studies or engineering blog posts
-- Framework/language documentation
-- Threat modeling or risk analysis
-- RFCs or design documents
+1. **Style disputes never converged.** "Use Result type" vs "use exceptions" is a project-convention question, not a debatable bug. The loop ran forever or escalated needlessly.
+2. **High-severity findings got buried.** A critical security issue and a naming nit had the same weight in the convergence check.
 
-### Rule 2: Two Round Maximum
-- Round 1: State positions, provide evidence
-- Round 2: Respond to evidence, attempt synthesis
-- After Round 2: Escalate or accept synthesis
+Per-issue states fix both: each finding has its own lifecycle, style is dropped from the loop entirely, and convergence is derived from the table.
 
-### Rule 3: Good Faith
-- Assume the other AI has valid reasoning
-- Look for complementary insights
-- Seek "both right in different ways" resolutions
-
-### Rule 4: Session Continuity
-- **Capture session ID** from Round 1 using `codex exec --json` (look for `thread_id` in output)
-- **Resume session** in Round 2 using `codex exec resume [SESSION_ID]`
-- This maintains conversation context so Codex remembers Round 1 discussion
-- Without session continuity, Round 2 starts fresh and loses valuable context
-
-### Rule 5: Classify Disagreement Type
-
-| Type | Definition | Action |
-|------|------------|--------|
-| Contradiction | Mutually exclusive positions | Must resolve one way |
-| Complement | Both valid, additive | Synthesize both |
-| Priority | Different ranking of same issues | Use project context |
-| Scope | Different interpretation of task | Clarify before proceeding |
-
-## Round 1 Structure
-
-### Claude's Opening
-```yaml
-position: "[Clear statement of recommendation]"
-evidence:
-  - code: "[specific file:line or pattern]"
-  - convention: "[from project standards]"
-  - rationale: "[technical reasoning]"
-confidence: "[high|medium|low]"
-open_to: "[what evidence would change your mind]"
-```
-
-### Codex's Response (via subagent)
-```yaml
-position: "[Clear statement]"
-agreement_areas: "[where aligned with Claude]"
-disagreement_areas: "[where divergent]"
-counter_evidence:
-  - code: "[specific reference]"
-  - rationale: "[technical reasoning]"
-```
-
-### Round 1 Outcome
-```yaml
-outcome: "[resolved|unresolved]"
-synthesis: "[if resolved, the merged view]"
-remaining_issues: "[if unresolved, specific points to address]"
-```
-
-## Round 2 Structure
-
-### Focus
-Address ONLY `remaining_issues` from Round 1. No new topics.
-
-### Claude's Response
-```yaml
-addressing: "[specific remaining issue]"
-new_evidence: "[something not presented in Round 1]"
-concession: "[what I now agree with from Codex]"
-maintained: "[what I still believe, with stronger reasoning]"
-```
-
-### Codex's Response
-```yaml
-addressing: "[specific remaining issue]"
-response_to_evidence: "[how new evidence changes or confirms view]"
-proposed_synthesis: "[attempt to merge positions]"
-```
-
-### Round 2 Outcome
-```yaml
-outcome: "[resolved|escalate]"
-final_synthesis: "[if resolved, the agreed approach]"
-escalation_reason: "[if escalating, why discussion failed]"
-escalation_question: "[precise question for Perplexity]"
-```
-
-## Example Discussion
-
-### Setup
-- Claude: "This function should use a Result/Either type for error handling"
-- Codex: "The current exception-based approach is clearer for this codebase"
-
-### Round 1
-
-**Claude:**
-```yaml
-position: "Use Result type for explicit error handling"
-evidence:
-  - code: "user_service.py:45 returns None on not-found"
-  - convention: "Project uses type hints extensively"
-  - rationale: "Result types are more expressive and statically checkable"
-confidence: "high"
-open_to: "Performance concerns or team familiarity arguments"
-```
-
-**Codex:**
-```yaml
-position: "Keep exception-based error handling"
-agreement_areas: "Explicit error handling is important"
-disagreement_areas: "Implementation approach"
-counter_evidence:
-  - code: "Other methods in user_service use exceptions consistently"
-  - rationale: "Consistency within module aids readability"
-```
-
-**Round 1 Outcome:**
-```yaml
-outcome: "unresolved"
-synthesis: null
-remaining_issues:
-  - "Module consistency vs modern idiom adoption"
-```
-
-### Round 2
-
-**Claude:**
-```yaml
-addressing: "Module consistency vs modern idiom"
-new_evidence: "Git history shows 3 commits in last month adopting Result types elsewhere"
-concession: "Consistency matters for readability"
-maintained: "Migration is already underway, this continues the pattern"
-```
-
-**Codex:**
-```yaml
-addressing: "Module consistency vs modern idiom"
-response_to_evidence: "Migration trend is valid context I missed"
-proposed_synthesis: "Use Result type here, add TODO for full module migration"
-```
-
-**Round 2 Outcome:**
-```yaml
-outcome: "resolved"
-final_synthesis: "Use Result type with TODO comment for module-wide migration"
-```
-
-## When Discussion Fails
-
-If after Round 2:
-- Positions remain fundamentally opposed
-- Evidence is inconclusive on both sides
-- Stakes are high (security, architecture, breaking changes)
-
-Then escalate with precise question:
+## State machine
 
 ```
-Given [specific context], should [option A] or [option B] be used?
+proposed ──┬─► accepted   (terminal: ship as fix)
+           ├─► rejected   (terminal: noise, both withdrew)
+           ├─► merged     (terminal: dupe of another id)
+           ├─► escalated  (carries to next round)
+           └─► deferred   (terminal: contested, present both views)
 
-Context:
-- Codebase: [language/framework]
-- Existing patterns: [relevant patterns]
-- Constraints: [any constraints]
-
-Claude's position: [summary with key evidence]
-Codex's position: [summary with key evidence]
-
-Which approach is correct and why?
+escalated ──┬─► accepted
+            ├─► rejected
+            └─► deferred  (auto, if no new evidence in round 3)
 ```
 
-## Anti-Patterns
+Terminal states drop out of the debate. Convergence = no issues in `proposed` or `escalated`.
 
-### Bad Discussion
-- **Echo Chamber:** Restating positions without new evidence
-- **Goalpost Moving:** Changing the disagreement mid-discussion
-- **Appeal to Authority:** "Codex/Claude is usually right"
-- **False Consensus:** Claiming agreement without actual alignment
+## Round structure
 
-### Good Discussion
-- **Evidence-Based:** Every claim backed by code or standards
-- **Focused:** One issue at a time
-- **Constructive:** Seeking synthesis, not victory
-- **Honest:** Acknowledging uncertainty and conceding valid points
+### Round 0 — blind pass
+
+Both AIs receive the **identical prompt** with no knowledge of each other. Output: a `findings` JSONL block.
+
+After the round, the orchestrator merges by content-hashed `id`:
+
+```bash
+jq -s '
+  add
+  | group_by(.id)
+  | map({
+      id: .[0].id,
+      file: .[0].file,
+      severity: .[0].severity,
+      claim: .[0].claim,
+      evidence: (map(.evidence) | unique | join(" || ")),
+      category: .[0].category,
+      source: (if length == 2 then "both" else .[0]._source end),
+      status: "proposed"
+    })
+' /tmp/claude_findings.jsonl /tmp/codex_findings.jsonl > /tmp/canonical.json
+```
+
+Findings reported by **both** AIs get `source: "both"` and almost always become `accepted` in round 1 — that's the highest-confidence signal in the system.
+
+### Round 1 — first debate
+
+Each side sees the canonical issue table and emits stances:
+
+```jsonl
+{"id":"a1b2","stance":"accept","reasoning":"Confirmed by reading handler.go:42"}
+{"id":"c3d4","stance":"defend","reasoning":"This is intentional per ADR-007"}
+{"id":"e5f6","stance":"dismiss","reasoning":"Codex is wrong — there's a guard at line 38"}
+```
+
+Stances:
+
+| Stance | Meaning | Required |
+|--------|---------|----------|
+| `accept` | I agree with the issue (mine or theirs) | reasoning |
+| `concede` | I withdraw an issue I previously raised | reasoning |
+| `defend` | I maintain this issue | reasoning; new_evidence required from round 3 onward |
+| `dismiss` | The other AI's claim is wrong | reasoning, ideally counter-evidence |
+
+After both sides respond, the orchestrator transitions states:
+
+| Claude → | Codex → | Result |
+|----------|---------|--------|
+| accept | accept | **accepted** |
+| accept | defend | **accepted** (Claude conceded the point Codex was raising) |
+| concede | dismiss | **rejected** (both withdrew) |
+| dismiss | concede | **rejected** |
+| defend | defend | **escalated** (carry forward) |
+| defend | dismiss | **escalated** (real disagreement) |
+| dismiss | defend | **escalated** |
+| concede | accept | **accepted** |
+
+### Round 2 — second debate
+
+Same as round 1, but operates only on `escalated` issues. Each side may include `new_evidence`. New issues raised in round 2 are valid (start as `proposed`) but must clear the lens checks.
+
+### Round 3 — final (only if cap extended)
+
+Same as round 2, but `escalated` issues without `new_evidence` auto-transition to `deferred`.
+
+After round 3, all remaining `escalated` and `proposed` issues become `deferred` and are presented to the user as Contested.
+
+## Lens enforcement
+
+Both lenses (Critic and Defender, see SKILL.md) apply in every round, including the debate rounds.
+
+**Critic lens in debate:** if you're emitting `defend`, your reasoning must contain a concrete failure mode, exploit path, or test case — not "I still think this is risky."
+
+**Defender lens in debate:** before emitting `defend`, check whether an existing test, invariant, or comment already addresses the concern. If yes, switch to `concede`.
+
+## Session resume
+
+Each side's Codex calls use `codex exec resume <session_id>` if a session ID was extracted from the round 0 JSONL. This is a **latency optimization** — round prompts re-inject the canonical issue table either way, so a session-store error degrades speed but not correctness.
+
+```bash
+SESSION_ID=$(jq -r 'select(.type=="thread.started") | .thread_id' /tmp/codex_round0.jsonl | head -1)
+
+if [ -n "$SESSION_ID" ]; then
+  CODEX_CMD="codex exec --profile peer-review --sandbox read-only resume $SESSION_ID"
+else
+  CODEX_CMD="codex exec --profile peer-review --sandbox read-only"
+fi
+```
+
+## Anti-patterns
+
+### Round-level synthesis
+"After both sides responded, I averaged their views and called it resolved." — No. Convergence is mechanical: issues transition states, the table is checked. There is no LLM judging the LLMs.
+
+### Re-asserting as new evidence
+A `defend` in round 3 that says "as I argued before, this is risky" is not new evidence. The orchestrator should detect repeated reasoning (substring match against prior round) and auto-defer.
+
+### Style disputes in the loop
+`severity: style` issues bypass the debate entirely. They land in the "Style notes" section of the verdict, derived from the project's formatter / linter / convention, not from AI consensus.
+
+### Promoting issues mid-debate
+An issue raised as `severity: low` in round 0 cannot become `severity: critical` in round 2 unless **new evidence** justifies the upgrade. Otherwise it's a goalpost move.
+
+## Example
+
+### Round 0 (blind)
+
+Claude finds:
+```jsonl
+{"id":"a1","file":"auth.ts:45","severity":"high","claim":"JWT validated without checking exp claim","evidence":"Test: forge token with exp=1, server accepts","category":"security"}
+{"id":"b2","file":"auth.ts:120","severity":"low","claim":"Variable name 'tmp' is unclear","evidence":"-","category":"style"}
+```
+
+Codex finds:
+```jsonl
+{"id":"a1","file":"auth.ts:45","severity":"critical","claim":"JWT exp not validated","evidence":"verify() call lacks exp check","category":"security"}
+{"id":"c3","file":"db.ts:88","severity":"medium","claim":"Connection pool not closed on error path","evidence":"Try block at line 80 has no finally; pool.acquire on error leaks","category":"correctness"}
+```
+
+### Canonicalization
+
+```
+a1: source=both, severity=critical (max of high/critical), status=proposed
+b2: source=claude, severity=style → DROPPED FROM DEBATE, surface as style note
+c3: source=codex, severity=medium, status=proposed
+```
+
+### Round 1 stances
+
+Claude:
+```jsonl
+{"id":"a1","stance":"accept","reasoning":"Already in my findings"}
+{"id":"c3","stance":"accept","reasoning":"Verified — finally block missing"}
+```
+
+Codex:
+```jsonl
+{"id":"a1","stance":"accept","reasoning":"Already in my findings"}
+{"id":"c3","stance":"accept","reasoning":"My finding, reaffirmed"}
+```
+
+### Final state
+
+```
+a1: accepted, severity=critical → CRITICAL verdict
+c3: accepted, severity=medium → IMPORTANT verdict
+b2: style note
+```
+
+Convergence after round 1. No further debate needed. Total Codex calls: 4 (2 blind + 2 round-1 stances).
+
+## When discussion fails
+
+If after round 2 (or extended round 3) issues remain in `escalated`:
+
+1. They become `deferred` and are presented as **Contested** in the verdict
+2. The user sees both views and decides
+3. **High-severity contested issues should also trigger external research** — pick the best research tool available; see escalation-criteria.md
+
+## Reference
+
+- Main protocol and prompt templates: SKILL.md
+- When to skip the debate entirely: escalation-criteria.md
+- Anti-patterns and recovery: common-mistakes.md

@@ -2,22 +2,20 @@
 
 Anti-patterns that undermine peer review effectiveness. When you catch yourself thinking these things, stop and correct course.
 
-## Using the Wrong Codex Command
+## Using Invalid Codex CLI Flags (Critical)
 
-**This is the #1 mistake.** Using `codex review` when you should use `codex exec`.
+The most expensive class of mistake — building workflows on flags that don't exist in the installed version.
 
-| Situation | Wrong | Right |
-|-----------|-------|-------|
-| Validating a design proposal | `codex review --base develop` | `codex exec "Validate this design: ..."` |
-| Validating a refactoring plan | `codex review --base develop` | `codex exec "Validate this refactoring: ..."` |
-| Answering a broad question | `codex review --base develop` | `codex exec "Question: ..."` |
-| Reviewing actual code changes | `codex exec "..."` | `codex review --base develop` |
+| Wrong | Right | Why |
+|-------|-------|-----|
+| `codex review --json` | `codex exec --json` | `codex review` does NOT support `--json` in 0.118.0 |
+| `codex review -o file` | `codex exec -o file` | `codex review` does NOT support `-o` in 0.118.0 |
+| `codex exec --output-schema schema.json --json` | Use prompt-template schemas | `--output-schema` is unstable under `--json` (timeouts, panics, no output) |
+| `codex exec resume <id> --output-schema ...` | Re-inject schema in the prompt | `resume` does not accept `--output-schema` |
+| `-m gpt-5.3-codex-spark` (hardcoded) | `--profile peer-review-summarizer` | Hardcoded models drift; profiles let users tune |
+| `-m gpt-5.4` (hardcoded) | `--profile peer-review` | Same — profiles centralize model config |
 
-**The rule:**
-- `codex review --base X` = reviews the **entire git diff** against branch X
-- `codex exec "..."` = executes a **focused prompt** about a specific thing
-
-**If you're validating Claude's proposal/design/recommendation, use `codex exec`.** Only use `codex review` when you're actually reviewing code changes.
+**Rule:** Anything that needs structured/streamed output goes through `codex exec`. `codex review` is for interactive human-readable review only, and even then we prefer `codex exec` so we can parse the result.
 
 ## Skipping Validation
 
@@ -25,140 +23,136 @@ Anti-patterns that undermine peer review effectiveness. When you catch yourself 
 |-----------------|---------|----------------|
 | "It's just a typo fix" | Typo fixes can break builds, introduce bugs | Validate anyway |
 | "I'm confident in this design" | Blind spots exist in every analysis | Validate anyway |
-| "Codex will just agree" | Often finds different issues you missed | Let it check |
+| "Codex will just agree" | The blind pass often surfaces things you missed | Run blind-debate |
 | "User is waiting" | Bad advice wastes more time than validation | Validate first |
 | "Similar to last time" | Context changes, different edge cases | Validate each time |
 | "This is too simple" | Simple things have hidden complexity | Validate anyway |
-| "I already checked everything" | Fresh perspective catches what you normalized | Validate anyway |
 
-**Rule:** If you're presenting a design, code review, or answering a broad question, validate with Codex.
+## Protocol Drift (Asymmetric Thinking in Symmetric Mode)
+
+`blind-debate` mode is symmetric. Both AIs get the **same prompt** with **no priming** about each other's likely findings. If you find yourself doing any of these, you're regressing to `classic` mode:
+
+| Drift | Fix |
+|-------|-----|
+| "Let me describe Claude's position to Codex" | NO — Codex reviews independently first |
+| "Codex will validate my findings" | NO — Codex produces its own findings, then they're merged |
+| "I'll skip Round 0 and go straight to debate" | NO — the blind pass IS the value |
+| "I already know what Codex will find" | Then you're priming yourself; run the blind pass |
+
+## Convergence Mistakes
+
+| Mistake | Reality | Fix |
+|---------|---------|-----|
+| Declaring `converged: true` from the model | Models will claim consensus to please you | Derive convergence from per-issue states only |
+| Style disputes blocking convergence | Style debates never resolve | Drop `severity: style` from the loop entirely |
+| Letting a `defend` survive round 3 without new evidence | Rationalization loop | Auto-defer if reasoning repeats |
+| Promoting a `low` issue to `critical` mid-debate | Goalpost moving | New evidence required to re-rank severity |
+| Treating `escalated` as resolution | Escalated means "carry forward, still unresolved" | Only `accepted/rejected/merged/deferred` are terminal |
+
+## Skipping Canonicalization
+
+| Mistake | Result |
+|---------|--------|
+| Sequential issue IDs (1, 2, 3...) | Same finding from both AIs enters debate twice |
+| Skipping the merge step | Doubled false positives |
+| Hashing on full claim text | Tiny wording differences create dupes |
+| Hashing on file only | Different bugs in same file collapse |
+
+**Rule:** `id = sha1(file + normalized_claim)`. Normalize whitespace and lowercase the claim before hashing.
 
 ## Premature Agreement
 
 | Rationalization | Reality | Correct Action |
 |-----------------|---------|----------------|
-| "Codex is probably right" | Both AIs can be wrong | Verify with evidence |
+| "Codex is probably right" | Both AIs can be wrong | Verify with evidence in stances |
 | "Don't want to argue with AI" | Technical truth matters more than peace | State your position |
-| "Let's just pick one" | Both might have valid points | Synthesize |
-| "Two rounds is enough" | Major issues need proper resolution | Escalate if needed |
-| "It doesn't matter much" | Small decisions compound | Decide correctly |
-| "Whatever is faster" | Fast wrong is slower than slow right | Take time to verify |
-
-**Rule:** Agreement should be based on evidence, not convenience.
+| "Let's just pick one" | Both might have valid points | Let the state machine resolve it |
+| "Whatever is faster" | Fast wrong is slower than slow right | Trust the protocol |
 
 ## Avoiding Escalation
 
 | Rationalization | Reality | Correct Action |
 |-----------------|---------|----------------|
-| "External research is overkill" | Expert input prevents costly errors | Use for major disputes |
-| "We've discussed enough" | Unresolved stays unresolved | Escalate |
-| "Security concern seems minor" | Security is never minor | Always escalate security |
+| "External research is overkill" | Expert input prevents costly errors | Use for security/architecture |
+| "We've debated enough" | Unresolved stays unresolved | Mark deferred, present as Contested |
+| "Security concern seems minor" | Security is never minor | Always immediate-escalate security |
 | "Don't want to slow down" | Wrong decisions cost more time | Take time to escalate |
-| "We can figure it out" | Two rounds failed; third won't help | Escalate |
-| "User won't notice" | Users notice bugs and security issues | Escalate |
-| "Perplexity isn't available" | WebSearch is a valid fallback | Use WebSearch instead |
-
-**Rule:** If two rounds don't resolve it, escalate (Perplexity if available, WebSearch otherwise). If it's security, escalate immediately.
-
-## Over-Escalation
-
-| Rationalization | Reality | Correct Action |
-|-----------------|---------|----------------|
-| "Better safe than sorry" | Style ≠ safety | Reserve for real disputes |
-| "Let external research decide everything" | Wastes time and resources | Try discussion first |
-| "Not sure about anything" | Build confidence through process | Trust the protocol |
-| "User will appreciate thoroughness" | User wants efficiency | Be judicious |
-
-**Rule:** Escalate major disagreements, not minor preferences.
 
 ## Subagent Misuse
 
 | Rationalization | Reality | Correct Action |
 |-----------------|---------|----------------|
-| "I'll run Codex in main context" | Fills context unnecessarily | Use subagent |
-| "Subagent is slower" | Context pollution is worse | Use subagent |
-| "I need to see Codex output live" | Summary is sufficient | Trust subagent |
-| "One quick check won't hurt" | Sets bad precedent | Use subagent always |
+| "I'll run Codex in the main context" | Fills main context with JSONL/transcripts | Always dispatch to the agent |
+| "I need to see Codex output live" | Verdict is what matters | Trust the agent's progress task |
+| "One quick check won't hurt" | Sets precedent for context pollution | Always dispatch |
+| "The agent is slower" | Context pollution is worse than latency | Always dispatch |
 
-**Rule:** Always dispatch Codex via subagent to preserve main context.
+## Forgetting Profile Configuration
 
-## Forgetting Session Continuity
+| Mistake | Fix |
+|---------|-----|
+| Hardcoding `-m gpt-5.4` in prompts | Use `--profile peer-review` |
+| Hardcoding `-m gpt-5.3-codex-spark` for summarization | Use `--profile peer-review-summarizer` |
+| Skipping the pre-flight check for the profile | Run the check; surface init instructions if missing |
+| Editing prompts to set `model_reasoning_effort` | That belongs in the profile, not the prompt |
 
-| Rationalization | Reality | Correct Action |
-|-----------------|---------|----------------|
-| "I'll just run codex exec again" | Round 2 loses all Round 1 context | Use `codex exec resume [SESSION_ID]` |
-| "Session IDs are complicated" | Just parse `thread_id` from JSON output | Use `--json` flag and extract ID |
-| "It probably remembers anyway" | Each `codex exec` starts fresh | Always resume for Round 2 |
-| "The prompt has enough context" | Codex's own reasoning from Round 1 is lost | Resume maintains full context |
-
-**Rule:** Always capture session ID in Round 1 (`--json` flag) and resume it in Round 2 (`codex exec resume [ID]`).
+If `~/.codex/config.toml` is missing the profiles, tell the user to run `/codex-peer-review init`. Do not invent fallback model names.
 
 ## Guessing the Base Branch
 
 | Rationalization | Reality | Correct Action |
 |-----------------|---------|----------------|
-| "It's probably main" | Projects use different conventions | Ask the user |
+| "It's probably main" | Projects use different conventions | Ask via AskUserQuestion |
 | "I can auto-detect with git" | Detection can fail or be wrong | Ask the user |
-| "User won't want to be asked" | Wrong branch = useless review | Ask the user |
-| "develop is the standard" | Many projects use main, master, trunk, etc. | Ask the user |
-
-**Rule:** If the base branch is not explicitly provided, use `AskUserQuestion` to ask the user. Never guess.
+| "develop is the standard" | Many projects use main, master, trunk | Ask the user |
 
 ## Discussion Anti-Patterns
 
 ### Echo Chamber
-- **Symptom:** Restating same position with different words
-- **Fix:** Require new evidence in each round
+- **Symptom:** Restating the same `defend` reasoning round after round
+- **Fix:** Auto-defer if reasoning substring matches a prior round
 
 ### Goalpost Moving
-- **Symptom:** Disagreement shifts to new topic mid-discussion
-- **Fix:** Lock in original dispute, address others separately
+- **Symptom:** Severity bumped or scope shifted mid-debate without new evidence
+- **Fix:** Lock in original severity unless new evidence justifies promotion
 
 ### Appeal to Authority
-- **Symptom:** "Claude/Codex is usually right about this"
-- **Fix:** Require codebase evidence, not reputation
+- **Symptom:** "Codex is usually right about security" or "Claude knows the codebase better"
+- **Fix:** Stances require evidence in `reasoning`, not reputation
 
 ### False Consensus
-- **Symptom:** Claiming agreement when positions still differ
-- **Fix:** Require explicit position statements that match
-
-### Sunk Cost Fallacy
-- **Symptom:** "We've discussed so long, let's just go with X"
-- **Fix:** Escalate if truly unresolved
+- **Symptom:** Both sides emit `accept` without actually verifying the issue
+- **Fix:** `accept` reasoning must reference specific code or test, not "agreed"
 
 ## Recovery Strategies
 
 ### If validation was skipped
-1. Stop presenting result
-2. Trigger validation now
+1. Stop presenting the result
+2. Trigger blind-debate now
 3. Update recommendation if needed
 4. Explain the update honestly
 
-### If wrong conclusion reached
-1. Acknowledge the error
-2. Show correct analysis
-3. Explain what was missed
-4. Document for future
+### If the wrong mode was used
+1. Acknowledge — `classic` mode is weaker
+2. Re-run in `blind-debate`
+3. Note any new findings the symmetric pass surfaced
 
-### If escalation needed after presentation
-1. Inform user of uncertainty
-2. Escalate to Perplexity
-3. Update recommendation
-4. Note correction in output
+### If `--output-schema` was attempted and failed
+1. The flag is unstable in 0.118.0 — this is expected
+2. Switch to prompt-template schemas (the SKILL.md prompts already do this)
+3. Parse with `jq` against the `findings` / `stances` blocks
 
-## Red Flags - STOP and Check
+## Red Flags — STOP and Check
 
 If you think any of these, pause and reconsider:
 
 - "This doesn't need validation"
-- "Codex will just agree anyway"
-- "Security issue is probably fine"
-- "No time for peer review"
-- "I'll skip the subagent just this once"
-- "Discussion is taking too long"
-- "Let's not bother with external research"
-- "User won't care about this detail"
-- "The base branch is probably main/develop"
-- "I can figure out the base branch from git"
+- "I'll just describe Claude's view to Codex" (regression to classic mode)
+- "I'll declare convergence and move on" (no — let the state machine decide)
+- "I'll use codex review with --json" (the flag does not exist)
+- "I'll hardcode gpt-5.4 in the prompt" (use the profile)
+- "Style issues should be in the verdict" (no — they go in style notes)
+- "Round 3 with no new evidence is fine" (no — auto-defer)
+- "I can skip the canonicalization step" (no — duplicates ruin the debate)
 
 **All of these mean:** You should do the opposite of what you're considering.
