@@ -41,12 +41,12 @@ You are a **thin dispatcher**. The full peer review protocol lives in the `codex
    ```
    If present, use that path as `$SKILL_ROOT`.
 
-   Otherwise, autodiscover by globbing the standard plugin install locations (in order):
+   Otherwise, autodiscover by globbing the standard plugin install locations. **Run the entire chain as a SINGLE bash command** so the shell short-circuits with `||` rather than the harness running each glob as a parallel tool call:
    ```bash
-   ls ~/.claude/plugins/cache/*/codex-peer-review/*/skills/codex-peer-review/SKILL.md
-   ls ~/.claude/plugins/marketplaces/*/plugins/codex-peer-review/skills/codex-peer-review/SKILL.md
+   ls ~/.claude/plugins/cache/*/codex-peer-review/*/skills/codex-peer-review/SKILL.md 2>/dev/null \
+     || ls ~/.claude/plugins/marketplaces/*/plugins/codex-peer-review/skills/codex-peer-review/SKILL.md 2>/dev/null
    ```
-   Take the directory portion of the first match as `$SKILL_ROOT`. If neither match, fail loudly with:
+   Stdout will be the absolute path of the first match (cache preferred; marketplace mirror as fallback for installs where cache hasn't been populated yet). Take the directory portion as `$SKILL_ROOT`. If the chain prints nothing and exits nonzero, fail loudly with:
    ```
    ERROR: Could not locate codex-peer-review skill files. Either the plugin is not installed,
    or it is installed in a non-standard location. Pass SKILL_ROOT=<absolute path> in your
